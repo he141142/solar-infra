@@ -1,0 +1,5 @@
+cdk.out/
+# Contains the AWS account ID - never commit to a public repo
+cdk.context.json
+*.exe
+.idea/

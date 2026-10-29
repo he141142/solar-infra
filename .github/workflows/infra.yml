@@ -1,0 +1,94 @@
+name: infra
+
+# PR        -> vet + test + synth (không cần AWS credentials)
+# push main -> deploy dev
+# chạy tay  -> chọn stg/prd; GitHub environment của stg/prd đặt required reviewers
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, stg, prd]
+        default: dev
+
+permissions:
+  id-token: write # OIDC -> AWS
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  GOPRIVATE: github.com/he141142/*
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Access private Go modules (solar-shared)
+        env:
+          TOKEN: ${{ secrets.GO_MODULES_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+      - run: go vet ./...
+      - run: go test ./...
+      - run: npx aws-cdk@2 synth -c env=dev "**" --quiet
+
+  # Deploy từng project bằng role của account project đó, theo thứ tự phụ thuộc:
+  # trading (bus nhận forward) -> eventbus (forward vào trading) -> forecast (publish lên central bus).
+  # Stage cicd-* KHÔNG deploy ở đây: đó là bootstrap tạo ra chính các role này (chạy tay một lần).
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    concurrency: infra-${{ inputs.environment || 'dev' }}
+    env:
+      ENV: ${{ inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Access private Go modules (solar-shared)
+        env:
+          TOKEN: ${{ secrets.GO_MODULES_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_INFRA_ROLE_TRADING }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true # repo public: không để lộ account ID trong log
+      - run: npx aws-cdk@2 deploy -c env=$ENV -c project=trading "trading-$ENV/*" --require-approval never
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_INFRA_ROLE_EVENTBUS }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true # repo public: không để lộ account ID trong log
+      - run: npx aws-cdk@2 deploy -c env=$ENV -c project=eventbus "eventbus-$ENV/*" --require-approval never
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_INFRA_ROLE_FORECAST }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true # repo public: không để lộ account ID trong log
+      - run: npx aws-cdk@2 deploy -c env=$ENV -c project=forecast "forecast-$ENV/*" --require-approval never
